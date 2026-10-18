@@ -48,3 +48,16 @@ for (p_name in c("none", "demean", "demean_scale")){
   }
 }
 
+df = read.csv(file.path(PROJECT_DIR, "/data/spectral/l2_norms.csv"))
+
+for (p_name in c("none", "demean", "demean_scale")){
+  
+  for (type_name in c("text", "image")){
+    
+    plot = plot_spectral(df, type = type_name, p = p_name, truncate = 300, xlab = "Order", 
+                         ylab = "L2 Norm")
+    
+    ggsave(plot = plot, filename = file.path(PROJECT_DIR, "figures", paste0(type_name, "_", p_name, "_", "l2_norm.png")), width = 9, height = 6)
+  }
+}
+
