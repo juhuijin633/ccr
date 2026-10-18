@@ -48,7 +48,7 @@ rows_l2 = []
 
 embed_cols = cs.starts_with("image") | cs.starts_with("text")
 image_cols = [ c for c in image.columns if re.fullmatch(r"image_\d+", c) ]
-text_cols = [ c for c in image.columns if re.fullmatch(r"text_\d+", c)]
+text_cols = [ c for c in text.columns if re.fullmatch(r"text_\d+", c)]
 
 for p in ["none", "demean", "demean_scale"]: 
     
