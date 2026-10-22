@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """Monte Carlo simulation of Meza & Singh (2025) CCA / PCA / Whiten IV.
 
-Uses stored text (covariates) and image (instruments) embeddings.
+Uses stored text (covariates X) and image (instruments W) embeddings.
 
 Pipeline
 --------
 1. Load embeddings (one row per product: period == 0).
-2. Post-process in two ways (separate simulation designs):
-     (i)  demean columns          (as in process_embeddings.py)
-     (ii) demean then / column std
-3. PCA-truncate: replace text by its rank-k reconstruction and images by
-   their rank-l reconstruction in the original embedding dimension.
-   These low-rank matrices are the clean (X, W). Images overidentify when l > k.
-4. For j = 1..J (default 1000):
-     - Infuse correlated Gaussian noise (Meza & Singh Appendix B) -> (Z_X, Z_W)
-     - Build endogenous Y = X beta* + eps with eps orthogonal to span(W)
-     - Save artifacts under data/simulation_run/<design>/run{j}/
-     - Split 50/50; fit Oracle, PCA-2SLS, Whiten-2SLS, CCA-2SLS on train
-     - OOS MSE on test: (1/n_test) sum (Y - X beta_hat)^2
+2. Post-process: demean OR demean_scale (as in process_embeddings.py).
+3. PCA-truncate to scores: text -> n x k, image -> n x l  (default k=10, l=15).
+4. For j = 1..J:
+     - Add Appendix-B correlated Gaussian noise -> (Z_X, Z_W)
+     - Build endogenous Y = X beta* + eps (eps ⊥ span(W))
+     - Optionally save under data/simulation_run/<design>/run{j}/
+     - 50/50 split; fit Oracle / PCA / Whiten / CCA 2SLS on train
+     - OOS MSE: mean((Y - X @ beta_hat)^2) on test
 
-Noise process follows Appendix B of Meza & Singh (2025), "Canonical correlation
-regression with noisy data" (the synthetic design in Isaac's CCA-IV experiments).
+Noise follows Meza & Singh (2025) Appendix B.
 """
 
 from __future__ import annotations
@@ -37,7 +32,6 @@ try:
 except ImportError:
     PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-
 K_DEFAULT = 10
 L_DEFAULT = 15
 N_REPS_DEFAULT = 1000
@@ -48,390 +42,206 @@ SIGMA_EPS = 1.25
 SEED = 42
 
 
-# ---------------------------------------------------------------------------
-# Data loading / post-processing / PCA truncation
-# ---------------------------------------------------------------------------
 def _embedding_cols(df: pd.DataFrame, prefix: str) -> list[str]:
     return [c for c in df.columns if re.fullmatch(rf"{prefix}_\d+", c)]
 
 
 def load_clean_embeddings(project_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Full text/image matrices, one row per product (period 0)."""
     text = pd.read_parquet(project_dir / "data/embeddings/text_embeddings.parquet")
     image = pd.read_parquet(project_dir / "data/embeddings/image_embeddings.parquet")
-
     mask = text["period"].to_numpy() == 0
-    text_cols = _embedding_cols(text, "text")
-    image_cols = _embedding_cols(image, "image")
-
-    X_full = text.loc[mask, text_cols].to_numpy(dtype=np.float64)
-    W_full = image.loc[mask, image_cols].to_numpy(dtype=np.float64)
-    if X_full.shape[0] != W_full.shape[0]:
-        raise ValueError(
-            f"row mismatch after period filter: text {X_full.shape}, image {W_full.shape}"
-        )
-    return X_full, W_full
+    X = text.loc[mask, _embedding_cols(text, "text")].to_numpy(np.float64)
+    W = image.loc[mask, _embedding_cols(image, "image")].to_numpy(np.float64)
+    return X, W
 
 
 def post_process(M: np.ndarray, kind: str) -> np.ndarray:
-    """Column-wise demean / demean_scale (same as process_embeddings.py)."""
     if kind == "demean":
         return M - M.mean(axis=0, keepdims=True)
     if kind == "demean_scale":
-        mu = M.mean(axis=0, keepdims=True)
         sd = M.std(axis=0, ddof=1, keepdims=True)
         sd = np.where(sd < 1e-12, 1.0, sd)
-        return (M - mu) / sd
-    raise ValueError(f"unknown post-processing: {kind}")
+        return (M - M.mean(axis=0, keepdims=True)) / sd
+    raise ValueError(kind)
 
 
-def pca_reconstruct(M: np.ndarray, rank: int) -> np.ndarray:
-    """Rank-r SVD reconstruction in the original column space (n x p)."""
-    U, S, Vt = np.linalg.svd(M, full_matrices=False)
+def pca_scores(M: np.ndarray, rank: int) -> np.ndarray:
+    """n x rank PCA scores U_r * S_r."""
+    U, S, _ = np.linalg.svd(M, full_matrices=False)
     r = min(rank, U.shape[1])
-    return (U[:, :r] * S[:r]) @ Vt[:r, :]
+    return U[:, :r] * S[:r]
 
 
-def make_beta_star(X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """beta* in the row-space of X (unit direction along top right singular vector)."""
-    _, _, Vt = np.linalg.svd(X, full_matrices=False)
-    beta = Vt[0, :].copy()
-    beta /= np.linalg.norm(beta)
-    # small jitter so it is not exactly a single PC (still in row space)
-    noise = rng.normal(size=beta.shape)
-    noise = noise - Vt.T @ (Vt @ noise)  # orthogonal to row space -> 0 if full rank row space
-    # keep pure unit top-right-singular direction
-    return beta
-
-
-# ---------------------------------------------------------------------------
-# Noise infusion (Meza & Singh Appendix B)
-# ---------------------------------------------------------------------------
-def add_correlated_noise(
-    X: np.ndarray,
-    W: np.ndarray,
-    k: int,
-    ell: int,
-    rng: np.random.Generator,
-    alpha: float = ALPHA,
-    rho: float = RHO,
-    c1: float = C1,
+def add_noise(
+    X: np.ndarray, W: np.ndarray, rng: np.random.Generator,
+    alpha=ALPHA, rho=RHO, c1=C1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Z_X = X + H_X, Z_W = W + H_W with shared Gaussian noise on common columns."""
+    """Appendix B: correlated Gaussian measurement error."""
     n, p = X.shape
-    _, p_w = W.shape
-
-    sigma_hx = c1 / ((k + 1) ** alpha * np.sqrt(p))
-    sigma_hw = c1 / ((ell + 1) ** alpha * np.sqrt(p_w))
-
-    H_X = rng.normal(0.0, sigma_hx, size=(n, p))
-    H_W = rng.normal(0.0, sigma_hw, size=(n, p_w))
-
-    p_common = min(p, p_w)
-    if p_common > 0 and abs(rho) > 0:
-        z1 = rng.normal(size=(n, p_common))
-        z2 = rng.normal(size=(n, p_common))
-        H_X[:, :p_common] = sigma_hx * z1
-        H_W[:, :p_common] = sigma_hw * (
-            rho * z1 + np.sqrt(max(0.0, 1.0 - rho**2)) * z2
-        )
-
-    return X + H_X, W + H_W
+    _, q = W.shape
+    sig_x = c1 / ((p + 1) ** alpha * np.sqrt(p))
+    sig_w = c1 / ((q + 1) ** alpha * np.sqrt(q))
+    Hx = rng.normal(0.0, sig_x, size=(n, p))
+    Hw = rng.normal(0.0, sig_w, size=(n, q))
+    m = min(p, q)
+    z1 = rng.normal(size=(n, m))
+    z2 = rng.normal(size=(n, m))
+    Hx[:, :m] = sig_x * z1
+    Hw[:, :m] = sig_w * (rho * z1 + np.sqrt(max(0.0, 1.0 - rho**2)) * z2)
+    return X + Hx, W + Hw
 
 
-def simulate_outcome(
-    X: np.ndarray,
-    W: np.ndarray,
-    beta_star: np.ndarray,
-    ell: int,
-    rng: np.random.Generator,
-    sigma_eps: float = SIGMA_EPS,
+def make_outcome(
+    X: np.ndarray, W: np.ndarray, beta: np.ndarray,
+    rng: np.random.Generator, sigma_eps=SIGMA_EPS,
 ) -> np.ndarray:
-    """Y = X beta* + eps; eps correlated with X but orthogonal to span(W)."""
+    """Y = X beta + eps, with eps correlated with X but orthogonal to W."""
     n, p = X.shape
-    # Endogeneity direction inside the row space of X.
-    _, _, Vt = np.linalg.svd(X, full_matrices=False)
-    r = min(p, Vt.shape[0])
-    coef = np.linspace(1.0, 0.2, r)
-    gamma = Vt[:r, :].T @ (coef / np.linalg.norm(coef))
-
-    eta = rng.normal(0.0, 1.0, size=n)
-    eps0 = X @ gamma + eta
-
+    gamma = np.linspace(1.0, 0.2, p)
+    gamma /= np.linalg.norm(gamma)
+    eps0 = X @ gamma + rng.normal(0.0, 1.0, n)
     Uw, _, _ = np.linalg.svd(W, full_matrices=False)
-    Uw = Uw[:, : min(ell, Uw.shape[1])]
     eps = eps0 - Uw @ (Uw.T @ eps0)
-
-    scale = np.sqrt(np.mean(eps**2))
-    if scale > 0:
-        eps = eps * (sigma_eps / scale)
-    return X @ beta_star + eps
+    eps *= sigma_eps / (np.sqrt(np.mean(eps**2)) + 1e-15)
+    return X @ beta + eps
 
 
-# ---------------------------------------------------------------------------
-# Estimators (Meza & Singh Examples 1–4)
-# ---------------------------------------------------------------------------
-def _svd_truncate(Z: np.ndarray, rank: int):
+def _svd(Z: np.ndarray, r: int):
     U, S, Vt = np.linalg.svd(Z, full_matrices=False)
-    r = min(rank, U.shape[1])
-    return U[:, :r], S[:r], Vt[:r, :]
+    r = min(r, U.shape[1])
+    return U[:, :r], S[:r], Vt[:r]
 
 
-def _beta_from_P(P: np.ndarray, Y: np.ndarray) -> np.ndarray:
-    beta, *_ = np.linalg.lstsq(P, Y, rcond=None)
-    return beta
+def _lstsq(P: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    return np.linalg.lstsq(P, Y, rcond=None)[0]
 
 
-def _to_x_beta(P: np.ndarray, beta_p: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """Convert a second-stage coef on P into a structural coef on X.
-
-    We want beta_X such that X beta_X ≈ P beta_P (the IV fitted values), so
-    predictions of the form X_test @ beta_X are on the structural scale.
-    """
-    fitted = P @ beta_p
-    beta_x, *_ = np.linalg.lstsq(X, fitted, rcond=None)
-    return beta_x
+def fit_oracle(X, W, Y, ell):
+    Uw, _, _ = _svd(W, ell)
+    return _lstsq(Uw @ (Uw.T @ X), Y)
 
 
-def fit_oracle_2sls(X: np.ndarray, W: np.ndarray, Y: np.ndarray, ell: int) -> np.ndarray:
-    # P = proj_W X lives in the same coordinate system as X, so P^+ Y is structural.
-    Uw, _, _ = _svd_truncate(W, ell)
-    P = Uw @ (Uw.T @ X)
-    return _beta_from_P(P, Y)
-
-
-def fit_pca_2sls(Z_X: np.ndarray, Z_W: np.ndarray, Y: np.ndarray, k: int, ell: int) -> np.ndarray:
-    U, S, Vt = _svd_truncate(Z_X, k)
-    Uw, _, _ = _svd_truncate(Z_W, ell)
+def fit_pca(Zx, Zw, Y, k, ell):
+    U, S, Vt = _svd(Zx, k)
+    Uw, _, _ = _svd(Zw, ell)
     Xhat = (U * S) @ Vt
-    P = Uw @ (Uw.T @ Xhat)
-    return _beta_from_P(P, Y)
+    return _lstsq(Uw @ (Uw.T @ Xhat), Y)
 
 
-def fit_whiten_2sls(
-    Z_X: np.ndarray, Z_W: np.ndarray, Y: np.ndarray, k: int, ell: int
-) -> np.ndarray:
-    U, S, Vt = _svd_truncate(Z_X, k)
-    Uw, _, _ = _svd_truncate(Z_W, ell)
-    X_under = U @ Vt  # U_k V_k^\top
-    P = Uw @ (Uw.T @ X_under)
-    beta_p = _beta_from_P(P, Y)
-    # If P ≈ U V' and X ≈ U diag(S) V', then beta_P ≈ V S V' beta_X.
+def fit_whiten(Zx, Zw, Y, k, ell):
+    U, S, Vt = _svd(Zx, k)
+    Uw, _, _ = _svd(Zw, ell)
+    P = Uw @ (Uw.T @ (U @ Vt))
+    beta_p = _lstsq(P, Y)
+    # Map whitened coef -> structural X-coef: beta_P ≈ V S V' beta_X
     return Vt.T @ ((Vt @ beta_p) / np.maximum(S, 1e-12))
 
 
-def fit_cca_2sls(Z_X: np.ndarray, Z_W: np.ndarray, Y: np.ndarray, k: int, ell: int) -> np.ndarray:
-    U, S, Vt = _svd_truncate(Z_X, k)
-    Uw, Sw, _ = _svd_truncate(Z_W, ell)
-    Sw_safe = np.maximum(Sw, Sw.max() * 1e-8)
+def fit_cca(Zx, Zw, Y, k, ell):
+    U, S, Vt = _svd(Zx, k)
+    Uw, Sw, _ = _svd(Zw, ell)
+    Sw = np.maximum(Sw, Sw.max() * 1e-8)
     Xhat = (U * S) @ Vt
-    cross = Uw.T @ U
-    P = (Uw * (1.0 / Sw_safe)) @ cross @ Vt
-    # Map IV fitted values P beta_P back into the column space of Xhat so that
-    # predictions of the form X @ beta remain well-defined / comparable.
-    return _to_x_beta(P, _beta_from_P(P, Y), Xhat)
+    P = (Uw * (1.0 / Sw)) @ (Uw.T @ U) @ Vt
+    fitted = P @ _lstsq(P, Y)
+    return _lstsq(Xhat, fitted)
 
 
-# ---------------------------------------------------------------------------
-# I/O
-# ---------------------------------------------------------------------------
-def _to_parquet(path: Path, M: np.ndarray, prefix: str) -> None:
-    cols = [f"{prefix}_{i:04d}" for i in range(M.shape[1])]
-    pd.DataFrame(M, columns=cols).to_parquet(path, index=False)
-
-
-def save_run_artifacts(
-    run_dir: Path,
-    X: np.ndarray,
-    W: np.ndarray,
-    Z_X: np.ndarray,
-    Z_W: np.ndarray,
-    Y: np.ndarray,
-) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _to_parquet(run_dir / "X_text.parquet", X, "text")
-    _to_parquet(run_dir / "W_image.parquet", W, "image")
-    _to_parquet(run_dir / "Z_text.parquet", Z_X, "text")
-    _to_parquet(run_dir / "Z_image.parquet", Z_W, "image")
-    pd.DataFrame({"Y": Y}).to_parquet(run_dir / "Y.parquet", index=False)
-
-
-# ---------------------------------------------------------------------------
-# One Monte Carlo replication
-# ---------------------------------------------------------------------------
-def one_replication(
-    X: np.ndarray,
-    W: np.ndarray,
-    beta_star: np.ndarray,
-    k: int,
-    ell: int,
-    rng: np.random.Generator,
-    run_dir: Path | None,
-) -> dict[str, float]:
-    Z_X, Z_W = add_correlated_noise(X, W, k, ell, rng)
-    Y = simulate_outcome(X, W, beta_star, ell, rng)
+def one_rep(X, W, beta, k, ell, rng, run_dir=None):
+    Zx, Zw = add_noise(X, W, rng)
+    Y = make_outcome(X, W, beta, rng)
 
     if run_dir is not None:
-        save_run_artifacts(run_dir, X, W, Z_X, Z_W, Y)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(X, columns=[f"text_{i:04d}" for i in range(X.shape[1])]).to_parquet(run_dir / "X_text.parquet", index=False)
+        pd.DataFrame(W, columns=[f"image_{i:04d}" for i in range(W.shape[1])]).to_parquet(run_dir / "W_image.parquet", index=False)
+        pd.DataFrame(Zx, columns=[f"text_{i:04d}" for i in range(Zx.shape[1])]).to_parquet(run_dir / "Z_text.parquet", index=False)
+        pd.DataFrame(Zw, columns=[f"image_{i:04d}" for i in range(Zw.shape[1])]).to_parquet(run_dir / "Z_image.parquet", index=False)
+        pd.DataFrame({"Y": Y}).to_parquet(run_dir / "Y.parquet", index=False)
 
-    n = X.shape[0]
+    n = len(Y)
     idx = rng.permutation(n)
-    half = n // 2
-    train, test = idx[:half], idx[half:]
-
-    X_tr, X_te = X[train], X[test]
-    W_tr = W[train]
-    Zx_tr, Zw_tr = Z_X[train], Z_W[train]
-    Y_tr, Y_te = Y[train], Y[test]
+    tr, te = idx[: n // 2], idx[n // 2 :]
 
     betas = {
-        "oracle": fit_oracle_2sls(X_tr, W_tr, Y_tr, ell),
-        "pca": fit_pca_2sls(Zx_tr, Zw_tr, Y_tr, k, ell),
-        "whiten": fit_whiten_2sls(Zx_tr, Zw_tr, Y_tr, k, ell),
-        "cca": fit_cca_2sls(Zx_tr, Zw_tr, Y_tr, k, ell),
+        "oracle": fit_oracle(X[tr], W[tr], Y[tr], ell),
+        "pca": fit_pca(Zx[tr], Zw[tr], Y[tr], k, ell),
+        "whiten": fit_whiten(Zx[tr], Zw[tr], Y[tr], k, ell),
+        "cca": fit_cca(Zx[tr], Zw[tr], Y[tr], k, ell),
     }
-
-    out: dict[str, float] = {}
-    for name, beta in betas.items():
-        y_hat = X_te @ beta
-        out[f"mse_{name}"] = float(np.mean((Y_te - y_hat) ** 2))
-        out[f"beta_err_{name}"] = float(np.mean((beta - beta_star) ** 2))
+    out = {}
+    for name, b in betas.items():
+        out[f"mse_{name}"] = float(np.mean((Y[te] - X[te] @ b) ** 2))
     return out
 
 
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
-def run_design(
-    X_full: np.ndarray,
-    W_full: np.ndarray,
-    design: str,
-    k: int,
-    ell: int,
-    n_reps: int,
-    seed: int,
-    out_root: Path,
-    save_runs: bool,
-) -> pd.DataFrame:
-    Xp = post_process(X_full, design)
-    Wp = post_process(W_full, design)
-    X = pca_reconstruct(Xp, k)
-    W = pca_reconstruct(Wp, ell)
-
-    # Fixed beta* across replications (depends on clean X only).
-    beta_star = make_beta_star(X, np.random.default_rng(seed))
+def run_design(X_full, W_full, design, k, ell, n_reps, seed, out_root, save_runs):
+    X = pca_scores(post_process(X_full, design), k)
+    W = pca_scores(post_process(W_full, design), ell)
+    beta = np.ones(k) / np.sqrt(k)
 
     design_dir = out_root / design
     design_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"beta_star": beta_star}).to_csv(design_dir / "beta_star.csv", index=False)
 
     rows = []
     for j in range(1, n_reps + 1):
         rng = np.random.default_rng(seed + j)
-        run_dir = design_dir / f"run{j}" if save_runs else None
-        stats = one_replication(X, W, beta_star, k, ell, rng, run_dir)
-        stats.update({"rep": j, "design": design, "k": k, "l": ell})
+        run_dir = (design_dir / f"run{j}") if save_runs else None
+        stats = one_rep(X, W, beta, k, ell, rng, run_dir)
+        stats.update(rep=j, design=design, k=k, l=ell)
         rows.append(stats)
-        if j % 50 == 0 or j == n_reps:
-            print(f"[{design}] finished replication {j}/{n_reps}", flush=True)
+        if j % 200 == 0 or j == n_reps:
+            print(f"[{design}] {j}/{n_reps}", flush=True)
 
     results = pd.DataFrame(rows)
     results.to_csv(design_dir / "mse_by_replication.csv", index=False)
-
-    metric_cols = [
-        "mse_oracle",
-        "mse_pca",
-        "mse_whiten",
-        "mse_cca",
-        "beta_err_oracle",
-        "beta_err_pca",
-        "beta_err_whiten",
-        "beta_err_cca",
-    ]
-    summary = (
-        results[metric_cols]
-        .agg(["mean", "std", "median"])
-        .T.reset_index()
-        .rename(columns={"index": "metric"})
-    )
-    summary.insert(0, "design", design)
-    summary.to_csv(design_dir / "mse_summary.csv", index=False)
+    summary = results[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].agg(["mean", "std", "median"]).T
+    summary.to_csv(design_dir / "mse_summary.csv")
     return results
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--k", type=int, default=K_DEFAULT, help="Text PCA rank / IV truncation")
-    p.add_argument("--l", type=int, default=L_DEFAULT, help="Image PCA rank / IV truncation")
-    p.add_argument("--n-reps", type=int, default=N_REPS_DEFAULT)
-    p.add_argument("--seed", type=int, default=SEED)
-    p.add_argument("--project-dir", type=Path, default=PROJECT_DIR)
-    p.add_argument("--out-dir", type=Path, default=None)
-    p.add_argument(
-        "--designs",
-        nargs="+",
-        default=["demean", "demean_scale"],
-        choices=["demean", "demean_scale"],
-    )
-    p.add_argument(
-        "--no-save-runs",
-        action="store_true",
-        help="Only write summary CSVs (skip per-rep parquet folders).",
-    )
-    p.add_argument("--smoke", action="store_true", help="2 replications for a quick test.")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--k", type=int, default=K_DEFAULT)
+    ap.add_argument("--l", type=int, default=L_DEFAULT)
+    ap.add_argument("--n-reps", type=int, default=N_REPS_DEFAULT)
+    ap.add_argument("--seed", type=int, default=SEED)
+    ap.add_argument("--project-dir", type=Path, default=PROJECT_DIR)
+    ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument("--designs", nargs="+", default=["demean", "demean_scale"])
+    ap.add_argument("--no-save-runs", action="store_true")
+    ap.add_argument("--smoke", action="store_true")
+    args = ap.parse_args()
     if args.smoke:
         args.n_reps = 2
 
-    project_dir = args.project_dir.resolve()
-    out_root = (args.out_dir or (project_dir / "data" / "simulation_run")).resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
+    project = args.project_dir.resolve()
+    out = (args.out_dir or project / "data" / "simulation_run").resolve()
+    out.mkdir(parents=True, exist_ok=True)
 
-    print(f"project_dir: {project_dir}")
-    print(f"out_dir:     {out_root}")
-    print(f"k={args.k}, l={args.l}, n_reps={args.n_reps}, designs={args.designs}")
+    print(f"project={project}  out={out}  k={args.k} l={args.l} reps={args.n_reps}")
+    X_full, W_full = load_clean_embeddings(project)
+    print(f"loaded text {X_full.shape}, image {W_full.shape}")
 
-    X_full, W_full = load_clean_embeddings(project_dir)
-    print(f"loaded embeddings: text {X_full.shape}, image {W_full.shape}")
-
-    all_results = []
+    all_res = []
     for design in args.designs:
         res = run_design(
-            X_full=X_full,
-            W_full=W_full,
-            design=design,
-            k=args.k,
-            ell=args.l,
-            n_reps=args.n_reps,
-            seed=args.seed,
-            out_root=out_root,
+            X_full, W_full, design, args.k, args.l, args.n_reps, args.seed, out,
             save_runs=not args.no_save_runs,
         )
-        all_results.append(res)
-        means = res[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean()
-        print(f"\n=== {design}: mean OOS MSE over {args.n_reps} reps ===")
-        print(means.to_string())
+        all_res.append(res)
+        print(res[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean().to_string())
+        print()
 
-    combined = pd.concat(all_results, ignore_index=True)
-    combined.to_csv(out_root / "mse_by_replication_all.csv", index=False)
-
-    summary = pd.DataFrame(
-        [
-            {
-                "design": design,
-                **res[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean().to_dict(),
-            }
-            for design, res in zip(args.designs, all_results)
-        ]
-    )
-    summary.to_csv(out_root / "mse_summary_all.csv", index=False)
-    print("\n=== overall mean MSE ===")
+    combined = pd.concat(all_res, ignore_index=True)
+    combined.to_csv(out / "mse_by_replication_all.csv", index=False)
+    summary = pd.DataFrame([
+        {"design": d, **r[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean().to_dict()}
+        for d, r in zip(args.designs, all_res)
+    ])
+    summary.to_csv(out / "mse_summary_all.csv", index=False)
     print(summary.to_string(index=False))
-    print(f"\nwrote summaries under {out_root}")
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":
