@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """Monte Carlo simulation of Meza & Singh (2025) CCA / PCA / Whiten IV.
 
-Uses stored text (covariates X) and image (instruments W) embeddings.
+Uses stored text (covariates) and image (instruments) embeddings.
 
 Pipeline
 --------
 1. Load embeddings (one row per product: period == 0).
 2. Post-process: demean OR demean_scale (as in process_embeddings.py).
-3. PCA-truncate to scores: text -> n x k, image -> n x l  (default k=10, l=15).
+3. Take left/right singular subspaces of the post-processed embeddings and
+   rebuild rank-(k, l) signal matrices with the Appendix B.1 power-law
+   spectrum Sigma_i = (i+1)^{-alpha}.  (Using raw PCA scores as X/W
+   leaves singular values O(10^2), which breaks Whiten/CCA scaling.)
 4. For j = 1..J:
-     - Add Appendix-B correlated Gaussian noise -> (Z_X, Z_W)
+     - Add Appendix-B.2 correlated Gaussian noise -> (Z_X, Z_W)
      - Build endogenous Y = X beta* + eps (eps ⊥ span(W))
      - Optionally save under data/simulation_run/<design>/run{j}/
      - 50/50 split; fit Oracle / PCA / Whiten / CCA 2SLS on train
      - OOS MSE: mean((Y - X @ beta_hat)^2) on test
 
-Noise follows Meza & Singh (2025) Appendix B.
+Estimators follow Meza & Singh Examples 1–4: beta_hat = P^+ Y with
+    Oracle:  P = proj_W X
+    PCA:     P = U~_l (U~_l' U_k) S_k V_k'
+    Whiten:  P = U~_l (U~_l' U_k) V_k'
+    CCA:     P = U~_l S~_l^{-1} (U~_l' U_k) V_k'
 """
 
 from __future__ import annotations
@@ -70,25 +77,43 @@ def post_process(M: np.ndarray, kind: str) -> np.ndarray:
     raise ValueError(kind)
 
 
-def pca_scores(M: np.ndarray, rank: int) -> np.ndarray:
-    """n x rank PCA scores U_r * S_r."""
-    U, S, _ = np.linalg.svd(M, full_matrices=False)
-    r = min(rank, U.shape[1])
-    return U[:, :r] * S[:r]
+def build_signal(
+    X_pp: np.ndarray, W_pp: np.ndarray, k: int, ell: int, alpha: float = ALPHA,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rank-(k, l) signals on embedding subspaces with Appendix B.1 spectrum."""
+    Ux, _, Vtx = np.linalg.svd(X_pp, full_matrices=False)
+    Uw, _, Vtw = np.linalg.svd(W_pp, full_matrices=False)
+    sig_x = (np.arange(1, k + 1, dtype=np.float64) + 1.0) ** (-alpha)
+    sig_w = (np.arange(1, ell + 1, dtype=np.float64) + 1.0) ** (-alpha)
+    X = (Ux[:, :k] * sig_x) @ Vtx[:k, :]
+    W = (Uw[:, :ell] * sig_w) @ Vtw[:ell, :]
+    # beta* in the row space of X (identified); unit length in factor coords
+    beta = Vtx[:k, :].T @ (np.ones(k) / np.sqrt(k))
+    return X, W, beta
 
 
 def add_noise(
-    X: np.ndarray, W: np.ndarray, rng: np.random.Generator,
-    alpha=ALPHA, rho=RHO, c1=C1,
+    X: np.ndarray,
+    W: np.ndarray,
+    k: int,
+    ell: int,
+    rng: np.random.Generator,
+    alpha=ALPHA,
+    rho=RHO,
+    c1=C1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Appendix B: correlated Gaussian measurement error."""
+    """Appendix B.2: correlated Gaussian measurement error.
+
+    Scale uses the latent ranks (k, l) and ambient dimensions (p, p_w),
+    not the ambient dimension in place of the rank.
+    """
     n, p = X.shape
-    _, q = W.shape
-    sig_x = c1 / ((p + 1) ** alpha * np.sqrt(p))
-    sig_w = c1 / ((q + 1) ** alpha * np.sqrt(q))
+    _, p_w = W.shape
+    sig_x = c1 / ((k + 1) ** alpha * np.sqrt(p))
+    sig_w = c1 / ((ell + 1) ** alpha * np.sqrt(p_w))
     Hx = rng.normal(0.0, sig_x, size=(n, p))
-    Hw = rng.normal(0.0, sig_w, size=(n, q))
-    m = min(p, q)
+    Hw = rng.normal(0.0, sig_w, size=(n, p_w))
+    m = min(p, p_w)
     z1 = rng.normal(size=(n, m))
     z2 = rng.normal(size=(n, m))
     Hx[:, :m] = sig_x * z1
@@ -97,8 +122,11 @@ def add_noise(
 
 
 def make_outcome(
-    X: np.ndarray, W: np.ndarray, beta: np.ndarray,
-    rng: np.random.Generator, sigma_eps=SIGMA_EPS,
+    X: np.ndarray,
+    W: np.ndarray,
+    beta: np.ndarray,
+    rng: np.random.Generator,
+    sigma_eps=SIGMA_EPS,
 ) -> np.ndarray:
     """Y = X beta + eps, with eps correlated with X but orthogonal to W."""
     n, p = X.shape
@@ -106,7 +134,8 @@ def make_outcome(
     gamma /= np.linalg.norm(gamma)
     eps0 = X @ gamma + rng.normal(0.0, 1.0, n)
     Uw, _, _ = np.linalg.svd(W, full_matrices=False)
-    eps = eps0 - Uw @ (Uw.T @ eps0)
+    r = min(W.shape[1], Uw.shape[1])
+    eps = eps0 - Uw[:, :r] @ (Uw[:, :r].T @ eps0)
     eps *= sigma_eps / (np.sqrt(np.mean(eps**2)) + 1e-15)
     return X @ beta + eps
 
@@ -121,69 +150,63 @@ def _lstsq(P: np.ndarray, Y: np.ndarray) -> np.ndarray:
     return np.linalg.lstsq(P, Y, rcond=None)[0]
 
 
-def fit_oracle(X, W, Y, ell):
-    Uw, _, _ = _svd(W, ell)
-    return _lstsq(Uw @ (Uw.T @ X), Y)
-
-
-def fit_pca(Zx, Zw, Y, k, ell):
-    U, S, Vt = _svd(Zx, k)
-    Uw, _, _ = _svd(Zw, ell)
-    Xhat = (U * S) @ Vt
-    return _lstsq(Uw @ (Uw.T @ Xhat), Y)
-
-
-def fit_whiten(Zx, Zw, Y, k, ell):
-    U, S, Vt = _svd(Zx, k)
-    Uw, _, _ = _svd(Zw, ell)
-    P = Uw @ (Uw.T @ (U @ Vt))
-    beta_p = _lstsq(P, Y)
-    # Map whitened coef -> structural X-coef: beta_P ≈ V S V' beta_X
-    return Vt.T @ ((Vt @ beta_p) / np.maximum(S, 1e-12))
-
-
-def fit_cca(Zx, Zw, Y, k, ell):
+def fit_all(X, W, Zx, Zw, Y, k, ell):
+    """Oracle / PCA / Whiten / CCA (Meza & Singh Ex. 1–4). Shared SVDs."""
+    Uw_clean, _, _ = _svd(W, ell)
     U, S, Vt = _svd(Zx, k)
     Uw, Sw, _ = _svd(Zw, ell)
     Sw = np.maximum(Sw, Sw.max() * 1e-8)
     Xhat = (U * S) @ Vt
-    P = (Uw * (1.0 / Sw)) @ (Uw.T @ U) @ Vt
-    fitted = P @ _lstsq(P, Y)
-    return _lstsq(Xhat, fitted)
+    UVt = U @ Vt
+
+    return {
+        # Ex. 1: P = proj_W X
+        "oracle": _lstsq(Uw_clean @ (Uw_clean.T @ X), Y),
+        # Ex. 2: P = U~_l (U~_l' U_k) S_k V_k'
+        "pca": _lstsq(Uw @ (Uw.T @ Xhat), Y),
+        # Ex. 3: P = U~_l (U~_l' U_k) V_k'
+        "whiten": _lstsq(Uw @ (Uw.T @ UVt), Y),
+        # Ex. 4: P = U~_l S~_l^{-1} (U~_l' U_k) V_k'
+        "cca": _lstsq((Uw * (1.0 / Sw)) @ (Uw.T @ U) @ Vt, Y),
+    }
 
 
 def one_rep(X, W, beta, k, ell, rng, run_dir=None):
-    Zx, Zw = add_noise(X, W, rng)
+    Zx, Zw = add_noise(X, W, k, ell, rng)
     Y = make_outcome(X, W, beta, rng)
 
     if run_dir is not None:
         run_dir.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(X, columns=[f"text_{i:04d}" for i in range(X.shape[1])]).to_parquet(run_dir / "X_text.parquet", index=False)
-        pd.DataFrame(W, columns=[f"image_{i:04d}" for i in range(W.shape[1])]).to_parquet(run_dir / "W_image.parquet", index=False)
-        pd.DataFrame(Zx, columns=[f"text_{i:04d}" for i in range(Zx.shape[1])]).to_parquet(run_dir / "Z_text.parquet", index=False)
-        pd.DataFrame(Zw, columns=[f"image_{i:04d}" for i in range(Zw.shape[1])]).to_parquet(run_dir / "Z_image.parquet", index=False)
+        pd.DataFrame(X, columns=[f"text_{i:04d}" for i in range(X.shape[1])]).to_parquet(
+            run_dir / "X_text.parquet", index=False
+        )
+        pd.DataFrame(W, columns=[f"image_{i:04d}" for i in range(W.shape[1])]).to_parquet(
+            run_dir / "W_image.parquet", index=False
+        )
+        pd.DataFrame(Zx, columns=[f"text_{i:04d}" for i in range(Zx.shape[1])]).to_parquet(
+            run_dir / "Z_text.parquet", index=False
+        )
+        pd.DataFrame(Zw, columns=[f"image_{i:04d}" for i in range(Zw.shape[1])]).to_parquet(
+            run_dir / "Z_image.parquet", index=False
+        )
         pd.DataFrame({"Y": Y}).to_parquet(run_dir / "Y.parquet", index=False)
 
     n = len(Y)
     idx = rng.permutation(n)
     tr, te = idx[: n // 2], idx[n // 2 :]
 
-    betas = {
-        "oracle": fit_oracle(X[tr], W[tr], Y[tr], ell),
-        "pca": fit_pca(Zx[tr], Zw[tr], Y[tr], k, ell),
-        "whiten": fit_whiten(Zx[tr], Zw[tr], Y[tr], k, ell),
-        "cca": fit_cca(Zx[tr], Zw[tr], Y[tr], k, ell),
-    }
+    betas = fit_all(X[tr], W[tr], Zx[tr], Zw[tr], Y[tr], k, ell)
     out = {}
     for name, b in betas.items():
         out[f"mse_{name}"] = float(np.mean((Y[te] - X[te] @ b) ** 2))
+        out[f"coef_{name}"] = float(np.mean((b - beta) ** 2))
     return out
 
 
 def run_design(X_full, W_full, design, k, ell, n_reps, seed, out_root, save_runs):
-    X = pca_scores(post_process(X_full, design), k)
-    W = pca_scores(post_process(W_full, design), ell)
-    beta = np.ones(k) / np.sqrt(k)
+    X_pp = post_process(X_full, design)
+    W_pp = post_process(W_full, design)
+    X, W, beta = build_signal(X_pp, W_pp, k, ell)
 
     design_dir = out_root / design
     design_dir.mkdir(parents=True, exist_ok=True)
@@ -195,12 +218,14 @@ def run_design(X_full, W_full, design, k, ell, n_reps, seed, out_root, save_runs
         stats = one_rep(X, W, beta, k, ell, rng, run_dir)
         stats.update(rep=j, design=design, k=k, l=ell)
         rows.append(stats)
-        if j % 200 == 0 or j == n_reps:
+        if j % 50 == 0 or j == n_reps:
             print(f"[{design}] {j}/{n_reps}", flush=True)
 
     results = pd.DataFrame(rows)
     results.to_csv(design_dir / "mse_by_replication.csv", index=False)
-    summary = results[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].agg(["mean", "std", "median"]).T
+    summary = results[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].agg(
+        ["mean", "std", "median"]
+    ).T
     summary.to_csv(design_dir / "mse_summary.csv")
     return results
 
@@ -231,19 +256,35 @@ def main():
     all_res = []
     for design in args.designs:
         res = run_design(
-            X_full, W_full, design, args.k, args.l, args.n_reps, args.seed, out,
+            X_full,
+            W_full,
+            design,
+            args.k,
+            args.l,
+            args.n_reps,
+            args.seed,
+            out,
             save_runs=not args.no_save_runs,
         )
         all_res.append(res)
         print(res[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean().to_string())
+        print(
+            "coef mse:",
+            res[["coef_oracle", "coef_pca", "coef_whiten", "coef_cca"]].mean().to_string(),
+        )
         print()
 
     combined = pd.concat(all_res, ignore_index=True)
     combined.to_csv(out / "mse_by_replication_all.csv", index=False)
-    summary = pd.DataFrame([
-        {"design": d, **r[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean().to_dict()}
-        for d, r in zip(args.designs, all_res)
-    ])
+    summary = pd.DataFrame(
+        [
+            {
+                "design": d,
+                **r[["mse_oracle", "mse_pca", "mse_whiten", "mse_cca"]].mean().to_dict(),
+            }
+            for d, r in zip(args.designs, all_res)
+        ]
+    )
     summary.to_csv(out / "mse_summary_all.csv", index=False)
     print(summary.to_string(index=False))
     print(f"wrote {out}")
