@@ -30,7 +30,12 @@ import pandas as pd
 try:
     from paths import PROJECT_DIR
 except ImportError:
-    PROJECT_DIR = Path(__file__).resolve().parent.parent
+    # Script: repo root is parent of code/. Notebook: __file__ is undefined.
+    try:
+        PROJECT_DIR = Path(__file__).resolve().parent.parent
+    except NameError:
+        cwd = Path.cwd()
+        PROJECT_DIR = cwd.parent if cwd.name == "code" else cwd
 
 K_DEFAULT = 10
 L_DEFAULT = 15
