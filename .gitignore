@@ -1,5 +1,7 @@
 data/raw/
 data/embeddings/
+data/simulation_run/
 code/paths*
+code/__pycache__/
 *.npy
 .DS_Store
